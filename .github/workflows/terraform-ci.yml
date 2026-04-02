@@ -1,0 +1,135 @@
+name: Smart Terraform CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.6.0"
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      payment_api: ${{ steps.changes.outputs.payment_api }}
+      global_iam: ${{ steps.changes.outputs.global_iam }}
+      skip_all: ${{ steps.changes.outputs.skip_all }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            payment_api:
+              - 'apps/payment-api/**'
+            global_iam:
+              - 'global/iam/**'
+            docs_only:
+              - 'CHANGELOG.md'
+            infra:
+              - '**/*.tf'
+              - '**/*.tfvars'
+
+      - name: Determine if pipeline should be skipped
+        id: skip
+        run: |
+          if [[ "${{ steps.changes.outputs.docs_only }}" == "true" && \
+                "${{ steps.changes.outputs.infra }}" == "false" && \
+                "${{ steps.changes.outputs.payment_api }}" == "false" && \
+                "${{ steps.changes.outputs.global_iam }}" == "false" ]]; then
+            echo "skip_all=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  plan-payment-api:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.skip_all != 'true' && (needs.detect-changes.outputs.payment_api == 'true' || needs.detect-changes.outputs.global_iam == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terraform Init - payment-api
+        working-directory: apps/payment-api
+        run: terraform init
+
+      - name: Terraform Plan - payment-api
+        id: plan
+        working-directory: apps/payment-api
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+
+      - name: Publish plan to Job Summary
+        if: always()
+        working-directory: apps/payment-api
+        run: |
+          echo "## Terraform Plan — payment-api" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat plan_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  plan-all:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.skip_all != 'true' && needs.detect-changes.outputs.global_iam == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [payment-api]  # add more apps here as needed
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terraform Init - ${{ matrix.app }}
+        working-directory: apps/${{ matrix.app }}
+        run: terraform init
+
+      - name: Terraform Plan - ${{ matrix.app }}
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+
+      - name: Publish plan to Job Summary
+        if: always()
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          echo "## Terraform Plan — ${{ matrix.app }} (triggered by global/iam change)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat plan_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  skip-notification:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.skip_all == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip notification
+        run: |
+          echo "## Pipeline Skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "Only documentation files changed — Terraform was not executed." >> "$GITHUB_STEP_SUMMARY"
